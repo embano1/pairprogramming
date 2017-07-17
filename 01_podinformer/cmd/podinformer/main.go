@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/embano1/tompodinformer/common"
+	"github.com/embano1/pairprogramming/01_podinformer/common"
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
