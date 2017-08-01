@@ -6,7 +6,7 @@ VERSION = 1.0
 default: build
 
 build:
-	GOOS=linux CGO_ENABLED=0 go build -installsuffix "static" -o ${BIN} ${BINPATH}/*.go
+	GOOS=linux CGO_ENABLED=0 go build -tags netgo -o ${BIN} ${BINPATH}/*.go
 
 image: 
 	docker build -t ${REPO}:${VERSION} .
