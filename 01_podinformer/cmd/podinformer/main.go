@@ -4,7 +4,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,21 +11,18 @@ import (
 
 	"github.com/embano1/pairprogramming/01_podinformer/common"
 	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
+
 	"k8s.io/client-go/kubernetes"
-	lister_v1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/fields"
 	"k8s.io/client-go/tools/cache"
 )
 
 type podWatcher struct {
-	kclient   kubernetes.Interface
-	podLister lister_v1.PodLister
-	informer  cache.Controller
-	stopCh    chan struct{}
-	doneCh    chan struct{}
+	kclient  kubernetes.Interface
+	informer cache.SharedInformer
+	stopCh   chan struct{}
+	doneCh   chan struct{}
 }
 
 type pwopts struct {
@@ -58,7 +54,20 @@ func main() {
 		glog.Fatalf("Failed to create kubernetes client: %v", err)
 	}
 
+	ver, err := kclient.DiscoveryClient.ServerVersion()
+	if err != nil {
+		glog.Fatalf("Failed to connect to API server: %v", err)
+	}
+
+	glog.Infof("Connected to API server (version: %s)", ver)
+
 	pw := newPodWatcher(kclient, *opts)
+	err = pw.informer.AddEventHandler(addHandlers())
+	if err != nil {
+		glog.Fatalf("Failed to add resource handlers: %v", err)
+	}
+
+	// Run the informer
 	go pw.Run()
 
 	sigs := make(chan os.Signal, 1)
@@ -79,78 +88,71 @@ func main() {
 }
 
 func newPodWatcher(kclient kubernetes.Interface, opts pwopts) *podWatcher {
-	rc := &podWatcher{
+	pw := &podWatcher{
 		kclient: kclient,
 		stopCh:  make(chan struct{}),
 		doneCh:  make(chan struct{}),
 	}
 
-	indexer, informer := cache.NewIndexerInformer(
-		&cache.ListWatch{
-			ListFunc: func(lo meta_v1.ListOptions) (runtime.Object, error) {
-				// We do not add any selectors because we want to watch all pods.
-				return kclient.Core().Pods(meta_v1.NamespaceDefault).List(lo)
-			},
-			WatchFunc: func(lo meta_v1.ListOptions) (watch.Interface, error) {
-				return kclient.Core().Pods(meta_v1.NamespaceDefault).Watch(lo)
-			},
-		},
+	lw := cache.NewListWatchFromClient(kclient.CoreV1().RESTClient(), "pods", v1.NamespaceDefault, fields.Everything())
+
+	informer := cache.NewSharedInformer(
+		// ListWatch
+		lw,
+
 		// The types of objects this informer will return
 		&v1.Pod{},
+
 		// The resync period of this object. This will force a re-queue of all cached objects at this interval.
 		// Every object will trigger the `Updatefunc` even if there have been no actual updates triggered.
-		// In some cases you can set this to a very high interval - as you can assume you will see periodic updates in normal operation.
-		// The interval is set low here for demo purposes.
 		opts.resync,
-		// Callback Functions to trigger on add/update/delete
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				// Type assertion
-				pod, ok := obj.(*v1.Pod)
-				if !ok {
-					glog.Infoln("This is no pod!")
-					return
-				}
-				fmt.Println("Pod created:", pod.Name)
-
-			},
-			UpdateFunc: func(old, new interface{}) {
-				// no-op()
-			},
-			DeleteFunc: func(obj interface{}) {
-				// Type assertion
-
-				pod, ok := obj.(*v1.Pod)
-				if !ok {
-					glog.Infoln("This is no pod!")
-					return
-				}
-				fmt.Println("Pod deleted:", pod.Name)
-			},
-		},
-		cache.Indexers{},
 	)
 
-	rc.informer = informer
-	// NodeLister avoids some boilerplate code (e.g. convert runtime.Object to *v1.node)
-	rc.podLister = lister_v1.NewPodLister(indexer)
-
-	return rc
+	pw.informer = informer
+	return pw
 }
 
 func (c *podWatcher) Run() {
-	glog.Info("Starting RebootController")
-
+	glog.Info("Starting PodWatcher")
 	go c.informer.Run(c.stopCh)
 
 	// Wait for all caches to be synced, before processing items from the queue is started
 	if !cache.WaitForCacheSync(c.stopCh, c.informer.HasSynced) {
-		glog.Error(fmt.Errorf("Timed out waiting for caches to sync"))
+		glog.Error("Timed out waiting for caches to sync")
 		return
 	}
 
 	<-c.stopCh
-	glog.Info("Stopping Reboot Controller")
+	glog.Info("Stopping PodWatcher")
 	// Signal that we´re ok to stop
 	c.doneCh <- struct{}{}
+}
+
+func addHandlers() cache.ResourceEventHandler {
+	// Callback Functions to trigger on add/update/delete
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			// Type assertion
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				glog.Infoln("This is no pod!")
+				return
+			}
+			glog.Info("Pod created: ", pod.Name)
+
+		},
+		UpdateFunc: func(old, new interface{}) {
+			// no-op()
+		},
+		DeleteFunc: func(obj interface{}) {
+			// Type assertion
+
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				glog.Infoln("This is no pod!")
+				return
+			}
+			glog.Info("Pod deleted: ", pod.Name)
+		},
+	}
 }

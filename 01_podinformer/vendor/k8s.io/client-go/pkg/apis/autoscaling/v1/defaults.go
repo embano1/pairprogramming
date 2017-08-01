@@ -17,11 +17,14 @@ limitations under the License.
 package v1
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/pkg/runtime"
 )
 
 func addDefaultingFuncs(scheme *runtime.Scheme) error {
-	return RegisterDefaults(scheme)
+	RegisterDefaults(scheme)
+	return scheme.AddDefaultingFuncs(
+		SetDefaults_HorizontalPodAutoscaler,
+	)
 }
 
 func SetDefaults_HorizontalPodAutoscaler(obj *HorizontalPodAutoscaler) {
@@ -29,7 +32,4 @@ func SetDefaults_HorizontalPodAutoscaler(obj *HorizontalPodAutoscaler) {
 		minReplicas := int32(1)
 		obj.Spec.MinReplicas = &minReplicas
 	}
-
-	// NB: we apply a default for CPU utilization in conversion because
-	// we need access to the annotations to properly apply the default.
 }

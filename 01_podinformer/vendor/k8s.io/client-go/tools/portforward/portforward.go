@@ -27,14 +27,11 @@ import (
 	"strings"
 	"sync"
 
-	"k8s.io/apimachinery/pkg/util/httpstream"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/kubelet/server/portforward"
+	"k8s.io/client-go/pkg/util/httpstream"
+	"k8s.io/client-go/pkg/util/runtime"
 )
-
-// TODO move to API machinery and re-unify with kubelet/server/portfoward
-// The subprotocol "portforward.k8s.io" is used for port forwarding.
-const PortForwardProtocolV1Name = "portforward.k8s.io"
 
 // PortForwarder knows how to listen for local connections and forward them to
 // a remote pod via an upgraded HTTP request.
@@ -135,7 +132,7 @@ func (pf *PortForwarder) ForwardPorts() error {
 	defer pf.Close()
 
 	var err error
-	pf.streamConn, _, err = pf.dialer.Dial(PortForwardProtocolV1Name)
+	pf.streamConn, _, err = pf.dialer.Dial(portforward.PortForwardProtocolV1Name)
 	if err != nil {
 		return fmt.Errorf("error upgrading connection: %s", err)
 	}
@@ -209,7 +206,8 @@ func (pf *PortForwarder) listenOnPortAndAddress(port *ForwardedPort, protocol st
 func (pf *PortForwarder) getListener(protocol string, hostname string, port *ForwardedPort) (net.Listener, error) {
 	listener, err := net.Listen(protocol, fmt.Sprintf("%s:%d", hostname, port.Local))
 	if err != nil {
-		return nil, fmt.Errorf("Unable to create listener: Error %s", err)
+		runtime.HandleError(fmt.Errorf("Unable to create listener: Error %s", err))
+		return nil, err
 	}
 	listenerAddress := listener.Addr().String()
 	host, localPort, _ := net.SplitHostPort(listenerAddress)
@@ -263,9 +261,9 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 
 	// create error stream
 	headers := http.Header{}
-	headers.Set(v1.StreamType, v1.StreamTypeError)
-	headers.Set(v1.PortHeader, fmt.Sprintf("%d", port.Remote))
-	headers.Set(v1.PortForwardRequestIDHeader, strconv.Itoa(requestID))
+	headers.Set(api.StreamType, api.StreamTypeError)
+	headers.Set(api.PortHeader, fmt.Sprintf("%d", port.Remote))
+	headers.Set(api.PortForwardRequestIDHeader, strconv.Itoa(requestID))
 	errorStream, err := pf.streamConn.CreateStream(headers)
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("error creating error stream for port %d -> %d: %v", port.Local, port.Remote, err))
@@ -287,7 +285,7 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 	}()
 
 	// create data stream
-	headers.Set(v1.StreamType, v1.StreamTypeData)
+	headers.Set(api.StreamType, api.StreamTypeData)
 	dataStream, err := pf.streamConn.CreateStream(headers)
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("error creating forwarding stream for port %d -> %d: %v", port.Local, port.Remote, err))

@@ -25,11 +25,11 @@ import (
 
 	"github.com/golang/groupcache/lru"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"k8s.io/client-go/pkg/api/unversioned"
 	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/util/clock"
+	"k8s.io/client-go/pkg/util/sets"
+	"k8s.io/client-go/pkg/util/strategicpatch"
 )
 
 const (
@@ -49,7 +49,6 @@ func getEventKey(event *v1.Event) string {
 		event.InvolvedObject.Kind,
 		event.InvolvedObject.Namespace,
 		event.InvolvedObject.Name,
-		event.InvolvedObject.FieldPath,
 		string(event.InvolvedObject.UID),
 		event.InvolvedObject.APIVersion,
 		event.Type,
@@ -94,7 +93,7 @@ type EventAggregatorMessageFunc func(event *v1.Event) string
 
 // EventAggregratorByReasonMessageFunc returns an aggregate message by prefixing the incoming message
 func EventAggregatorByReasonMessageFunc(event *v1.Event) string {
-	return "(combined from similar events): " + event.Message
+	return "(events with common reason combined)"
 }
 
 // EventAggregator identifies similar events and aggregates them into a single event
@@ -111,10 +110,10 @@ type EventAggregator struct {
 	messageFunc EventAggregatorMessageFunc
 
 	// The maximum number of events in the specified interval before aggregation occurs
-	maxEvents uint
+	maxEvents int
 
 	// The amount of time in seconds that must transpire since the last occurrence of a similar event before it's considered new
-	maxIntervalInSeconds uint
+	maxIntervalInSeconds int
 
 	// clock is used to allow for testing over a time interval
 	clock clock.Clock
@@ -127,8 +126,8 @@ func NewEventAggregator(lruCacheSize int, keyFunc EventAggregatorKeyFunc, messag
 		cache:                lru.New(lruCacheSize),
 		keyFunc:              keyFunc,
 		messageFunc:          messageFunc,
-		maxEvents:            uint(maxEvents),
-		maxIntervalInSeconds: uint(maxIntervalInSeconds),
+		maxEvents:            maxEvents,
+		maxIntervalInSeconds: maxIntervalInSeconds,
 		clock:                clock,
 	}
 }
@@ -139,25 +138,14 @@ type aggregateRecord struct {
 	// if the size of this set exceeds the max, we know we need to aggregate
 	localKeys sets.String
 	// The last time at which the aggregate was recorded
-	lastTimestamp metav1.Time
+	lastTimestamp unversioned.Time
 }
 
-// EventAggregate checks if a similar event has been seen according to the
-// aggregation configuration (max events, max interval, etc) and returns:
-//
-// - The (potentially modified) event that should be created
-// - The cache key for the event, for correlation purposes. This will be set to
-//   the full key for normal events, and to the result of
-//   EventAggregatorMessageFunc for aggregate events.
-func (e *EventAggregator) EventAggregate(newEvent *v1.Event) (*v1.Event, string) {
-	now := metav1.NewTime(e.clock.Now())
-	var record aggregateRecord
-	// eventKey is the full cache key for this event
-	eventKey := getEventKey(newEvent)
-	// aggregateKey is for the aggregate event, if one is needed.
+// EventAggregate identifies similar events and groups into a common event if required
+func (e *EventAggregator) EventAggregate(newEvent *v1.Event) (*v1.Event, error) {
 	aggregateKey, localKey := e.keyFunc(newEvent)
-
-	// Do we have a record of similar events in our cache?
+	now := unversioned.NewTime(e.clock.Now())
+	record := aggregateRecord{localKeys: sets.NewString(), lastTimestamp: now}
 	e.Lock()
 	defer e.Unlock()
 	value, found := e.cache.Get(aggregateKey)
@@ -165,32 +153,26 @@ func (e *EventAggregator) EventAggregate(newEvent *v1.Event) (*v1.Event, string)
 		record = value.(aggregateRecord)
 	}
 
-	// Is the previous record too old? If so, make a fresh one. Note: if we didn't
-	// find a similar record, its lastTimestamp will be the zero value, so we
-	// create a new one in that case.
+	// if the last event was far enough in the past, it is not aggregated, and we must reset state
 	maxInterval := time.Duration(e.maxIntervalInSeconds) * time.Second
 	interval := now.Time.Sub(record.lastTimestamp.Time)
 	if interval > maxInterval {
 		record = aggregateRecord{localKeys: sets.NewString()}
 	}
-
-	// Write the new event into the aggregation record and put it on the cache
 	record.localKeys.Insert(localKey)
 	record.lastTimestamp = now
 	e.cache.Add(aggregateKey, record)
 
-	// If we are not yet over the threshold for unique events, don't correlate them
-	if uint(record.localKeys.Len()) < e.maxEvents {
-		return newEvent, eventKey
+	if record.localKeys.Len() < e.maxEvents {
+		return newEvent, nil
 	}
 
 	// do not grow our local key set any larger than max
 	record.localKeys.PopAny()
 
-	// create a new aggregate event, and return the aggregateKey as the cache key
-	// (so that it can be overwritten.)
+	// create a new aggregate event
 	eventCopy := &v1.Event{
-		ObjectMeta: metav1.ObjectMeta{
+		ObjectMeta: v1.ObjectMeta{
 			Name:      fmt.Sprintf("%v.%x", newEvent.InvolvedObject.Name, now.UnixNano()),
 			Namespace: newEvent.Namespace,
 		},
@@ -203,16 +185,16 @@ func (e *EventAggregator) EventAggregate(newEvent *v1.Event) (*v1.Event, string)
 		Reason:         newEvent.Reason,
 		Source:         newEvent.Source,
 	}
-	return eventCopy, aggregateKey
+	return eventCopy, nil
 }
 
 // eventLog records data about when an event was observed
 type eventLog struct {
 	// The number of times the event has occurred since first occurrence.
-	count uint
+	count int
 
 	// The time at which the event was first recorded.
-	firstTimestamp metav1.Time
+	firstTimestamp unversioned.Time
 
 	// The unique name of the first occurrence of this event
 	name string
@@ -233,22 +215,22 @@ func newEventLogger(lruCacheEntries int, clock clock.Clock) *eventLogger {
 	return &eventLogger{cache: lru.New(lruCacheEntries), clock: clock}
 }
 
-// eventObserve records an event, or updates an existing one if key is a cache hit
-func (e *eventLogger) eventObserve(newEvent *v1.Event, key string) (*v1.Event, []byte, error) {
+// eventObserve records the event, and determines if its frequency should update
+func (e *eventLogger) eventObserve(newEvent *v1.Event) (*v1.Event, []byte, error) {
 	var (
 		patch []byte
 		err   error
 	)
+	key := getEventKey(newEvent)
 	eventCopy := *newEvent
 	event := &eventCopy
 
 	e.Lock()
 	defer e.Unlock()
 
-	// Check if there is an existing event we should update
 	lastObservation := e.lastEventObservationFromCache(key)
 
-	// If we found a result, prepare a patch
+	// we have seen this event before, so we must prepare a patch
 	if lastObservation.count > 0 {
 		// update the event based on the last observation so patch will work as desired
 		event.Name = lastObservation.name
@@ -258,19 +240,18 @@ func (e *eventLogger) eventObserve(newEvent *v1.Event, key string) (*v1.Event, [
 
 		eventCopy2 := *event
 		eventCopy2.Count = 0
-		eventCopy2.LastTimestamp = metav1.NewTime(time.Unix(0, 0))
-		eventCopy2.Message = ""
+		eventCopy2.LastTimestamp = unversioned.NewTime(time.Unix(0, 0))
 
 		newData, _ := json.Marshal(event)
 		oldData, _ := json.Marshal(eventCopy2)
-		patch, err = strategicpatch.CreateTwoWayMergePatch(oldData, newData, event)
+		patch, err = strategicpatch.CreateStrategicMergePatch(oldData, newData, event)
 	}
 
 	// record our new observation
 	e.cache.Add(
 		key,
 		eventLog{
-			count:           uint(event.Count),
+			count:           int(event.Count),
 			firstTimestamp:  event.FirstTimestamp,
 			name:            event.Name,
 			resourceVersion: event.ResourceVersion,
@@ -288,7 +269,7 @@ func (e *eventLogger) updateState(event *v1.Event) {
 	e.cache.Add(
 		key,
 		eventLog{
-			count:           uint(event.Count),
+			count:           int(event.Count),
 			firstTimestamp:  event.FirstTimestamp,
 			name:            event.Name,
 			resourceVersion: event.ResourceVersion,
@@ -356,7 +337,6 @@ func NewEventCorrelator(clock clock.Clock) *EventCorrelator {
 			defaultAggregateMaxEvents,
 			defaultAggregateIntervalInSeconds,
 			clock),
-
 		logger: newEventLogger(cacheSize, clock),
 	}
 }
@@ -366,8 +346,11 @@ func (c *EventCorrelator) EventCorrelate(newEvent *v1.Event) (*EventCorrelateRes
 	if c.filterFunc(newEvent) {
 		return &EventCorrelateResult{Skip: true}, nil
 	}
-	aggregateEvent, ckey := c.aggregator.EventAggregate(newEvent)
-	observedEvent, patch, err := c.logger.eventObserve(aggregateEvent, ckey)
+	aggregateEvent, err := c.aggregator.EventAggregate(newEvent)
+	if err != nil {
+		return &EventCorrelateResult{}, err
+	}
+	observedEvent, patch, err := c.logger.eventObserve(aggregateEvent)
 	return &EventCorrelateResult{Event: observedEvent, Patch: patch}, err
 }
 

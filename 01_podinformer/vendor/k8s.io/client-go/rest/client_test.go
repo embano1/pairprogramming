@@ -27,16 +27,14 @@ import (
 
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/diff"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/pkg/api/v1"
-	v1beta1 "k8s.io/client-go/pkg/apis/extensions/v1beta1"
-	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/api/errors"
+	"k8s.io/client-go/pkg/api/testapi"
+	"k8s.io/client-go/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/apimachinery/registered"
+	"k8s.io/client-go/pkg/runtime"
+	"k8s.io/client-go/pkg/util/diff"
+	utiltesting "k8s.io/client-go/pkg/util/testing"
 )
 
 type TestParam struct {
@@ -44,18 +42,17 @@ type TestParam struct {
 	expectingError        bool
 	actualCreated         bool
 	expCreated            bool
-	expStatus             *metav1.Status
+	expStatus             *unversioned.Status
 	testBody              bool
 	testBodyErrorIsNotNil bool
 }
 
-// TestSerializer makes sure that you're always able to decode metav1.Status
+// TestSerializer makes sure that you're always able to decode an unversioned API object
 func TestSerializer(t *testing.T) {
-	gv := v1beta1.SchemeGroupVersion
 	contentConfig := ContentConfig{
 		ContentType:          "application/json",
-		GroupVersion:         &gv,
-		NegotiatedSerializer: serializer.DirectCodecFactory{CodecFactory: scheme.Codecs},
+		GroupVersion:         &unversioned.GroupVersion{Group: "other", Version: runtime.APIVersionInternal},
+		NegotiatedSerializer: api.Codecs,
 	}
 
 	serializer, err := createSerializers(contentConfig)
@@ -86,14 +83,14 @@ func TestDoRequestSuccess(t *testing.T) {
 }
 
 func TestDoRequestFailed(t *testing.T) {
-	status := &metav1.Status{
+	status := &unversioned.Status{
 		Code:    http.StatusNotFound,
-		Status:  metav1.StatusFailure,
-		Reason:  metav1.StatusReasonNotFound,
+		Status:  unversioned.StatusFailure,
+		Reason:  unversioned.StatusReasonNotFound,
 		Message: " \"\" not found",
-		Details: &metav1.StatusDetails{},
+		Details: &unversioned.StatusDetails{},
 	}
-	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), status)
+	expectedBody, _ := runtime.Encode(testapi.Default.Codec(), status)
 	fakeHandler := utiltesting.FakeHandler{
 		StatusCode:   404,
 		ResponseBody: string(expectedBody),
@@ -121,18 +118,18 @@ func TestDoRequestFailed(t *testing.T) {
 }
 
 func TestDoRawRequestFailed(t *testing.T) {
-	status := &metav1.Status{
+	status := &unversioned.Status{
 		Code:    http.StatusNotFound,
-		Status:  metav1.StatusFailure,
-		Reason:  metav1.StatusReasonNotFound,
+		Status:  unversioned.StatusFailure,
+		Reason:  unversioned.StatusReasonNotFound,
 		Message: "the server could not find the requested resource",
-		Details: &metav1.StatusDetails{
-			Causes: []metav1.StatusCause{
-				{Type: metav1.CauseTypeUnexpectedServerResponse, Message: "unknown"},
+		Details: &unversioned.StatusDetails{
+			Causes: []unversioned.StatusCause{
+				{Type: unversioned.CauseTypeUnexpectedServerResponse, Message: "unknown"},
 			},
 		},
 	}
-	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), status)
+	expectedBody, _ := runtime.Encode(testapi.Default.Codec(), status)
 	fakeHandler := utiltesting.FakeHandler{
 		StatusCode:   404,
 		ResponseBody: string(expectedBody),
@@ -231,13 +228,12 @@ func validate(testParam TestParam, t *testing.T, body []byte, fakeHandler *utilt
 			t.Errorf("Expected object not to be created")
 		}
 	}
-	statusOut, err := runtime.Decode(scheme.Codecs.UniversalDeserializer(), body)
+	statusOut, err := runtime.Decode(testapi.Default.Codec(), body)
 	if testParam.testBody {
-		if testParam.testBodyErrorIsNotNil && err == nil {
-			t.Errorf("Expected Error")
-		}
-		if !testParam.testBodyErrorIsNotNil && err != nil {
-			t.Errorf("Unexpected Error: %v", err)
+		if testParam.testBodyErrorIsNotNil {
+			if err == nil {
+				t.Errorf("Expected Error")
+			}
 		}
 	}
 
@@ -246,7 +242,7 @@ func validate(testParam TestParam, t *testing.T, body []byte, fakeHandler *utilt
 			t.Errorf("Unexpected mis-match. Expected %#v.  Saw %#v", testParam.expStatus, statusOut)
 		}
 	}
-	fakeHandler.ValidateRequest(t, "/"+v1.SchemeGroupVersion.String()+"/test", "GET", nil)
+	fakeHandler.ValidateRequest(t, "/"+registered.GroupOrDie(api.GroupName).GroupVersion.String()+"/test", "GET", nil)
 
 }
 
@@ -275,7 +271,7 @@ func TestHttpMethods(t *testing.T) {
 		t.Errorf("Delete : Object returned should not be nil")
 	}
 
-	request = c.Patch(types.JSONPatchType)
+	request = c.Patch(api.JSONPatchType)
 	if request == nil {
 		t.Errorf("Patch : Object returned should not be nil")
 	}
@@ -317,9 +313,9 @@ func TestCreateBackoffManager(t *testing.T) {
 
 }
 
-func testServerEnv(t *testing.T, statusCode int) (*httptest.Server, *utiltesting.FakeHandler, *metav1.Status) {
-	status := &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: fmt.Sprintf("%s", metav1.StatusSuccess)}
-	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), status)
+func testServerEnv(t *testing.T, statusCode int) (*httptest.Server, *utiltesting.FakeHandler, *unversioned.Status) {
+	status := &unversioned.Status{Status: fmt.Sprintf("%s", unversioned.StatusSuccess)}
+	expectedBody, _ := runtime.Encode(testapi.Default.Codec(), status)
 	fakeHandler := utiltesting.FakeHandler{
 		StatusCode:   statusCode,
 		ResponseBody: string(expectedBody),
@@ -333,8 +329,8 @@ func restClient(testServer *httptest.Server) (*RESTClient, error) {
 	c, err := RESTClientFor(&Config{
 		Host: testServer.URL,
 		ContentConfig: ContentConfig{
-			GroupVersion:         &v1.SchemeGroupVersion,
-			NegotiatedSerializer: serializer.DirectCodecFactory{CodecFactory: scheme.Codecs},
+			GroupVersion:         &registered.GroupOrDie(api.GroupName).GroupVersion,
+			NegotiatedSerializer: testapi.Default.NegotiatedSerializer(),
 		},
 		Username: "user",
 		Password: "pass",
